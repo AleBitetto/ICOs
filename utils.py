@@ -23,6 +23,7 @@ from pdf2image import convert_from_path
 import pytesseract
 from PIL import Image
 from tika import parser
+from thefuzz import process
 
 
 
@@ -155,8 +156,14 @@ def download_from_drive_dropbox(chromedriver_path='', download_url='', download_
         time.sleep(2)
         ActionChains(driver).send_keys(Keys.ESCAPE).perform()
     else:
-        raise ValueError('Please provide "soure", can be "drive" or "dropbox"')
+        raise ValueError('Please provide "source", can be "drive" or "dropbox"')
     page_error = "page not available"
+    try:
+        time.sleep(1.5)
+        driver.find_element(By.CLASS_NAME, "action-bar-action-DOWNLOAD_ACTION").click()
+        page_error = ""
+    except:
+        pass
     try:
         time.sleep(1.5)
         driver.find_element("xpath", download_button_xpath[0]).click()
@@ -854,3 +861,752 @@ def summary_stats(df=None, date_format='D', n_digits=2):
     final_stats.fillna('', inplace=True)
     
     return final_stats
+
+def convert_fund(x):
+    
+    if len(x) > 0:
+        if '$' in x:
+            out=int(float(x.replace('$', '').replace(',', '').strip()))
+        else:
+            out=x
+    else:
+        out=None
+    
+    return out
+
+def extract_price(row):
+    
+    CURRENCY=['USD', 'EUR', 'ETH', 'BNB', 'USDT', 'BTC', 'CHF']
+    
+    error=''
+    warning=''
+    ticker=row['Ticker']
+    price=(row['Price'].replace('$', 'USD').replace('€', 'EUR').replace('\u200b', '').replace('~', '')
+           .replace('00.000', '00000').replace('.000.000', '000000').replace('0.000.000', '0000000')
+           .replace('00.000.000', '00000000').replace('.000.000.000', '000000000'))
+    
+    # split token and currency
+    if ticker == '':
+        ticker='xxxx1111yyyy'
+    split_str=re.split('==|≈|=|—|:|＝', price)
+    if len(split_str) == 1 and ticker in price:
+        split_str=re.split('-', price)
+    token_ind=[i for i, x in enumerate(split_str) if ticker in x and len(x)>0]
+    currency_ind=[i for i, x in enumerate(split_str) if ticker not in x and len(x)>0]
+    if len(token_ind) > 1 or len(currency_ind) > 1:
+        retrieve_currency_ind=np.unique([i for i, y in enumerate(split_str) for x in CURRENCY if x in y]).tolist()
+        if len(retrieve_currency_ind) == 1:
+            currency_ind=retrieve_currency_ind
+            token_ind=list(set(range(len(split_str))) - set(currency_ind))
+            warning+='-multiple token or currency index recovered'
+        else:
+            error+='-multiple token or currency index '
+    token_part= split_str[token_ind[0]] if token_ind else ''
+    currency_part= split_str[currency_ind[0]] if currency_ind else ''
+
+    # extract unit and currency
+    token_unit=''
+    if len(token_part) > 0:
+        token_unit=token_part.replace(ticker, '').strip()
+        if token_unit.startswith('0,'):
+            token_unit=token_unit.replace('0,', '0.')
+        else:
+            token_unit=token_unit.replace(',', '')
+        if re.sub('[A-Za-z]+', '', token_unit) != token_unit:   # try to remove mismatch in ticker
+            token_unit=re.sub('[A-Za-z]+', '', token_unit)
+            warning+='-adjusted ticker'
+    if len(token_unit) == 0:
+        token_unit='1'
+    token_unit_num=None
+    token_unit=token_unit.replace(' ', '').replace('[', '').replace(']', '')
+    if '-' in token_unit:    # price range -> take average
+        try:
+            token_unit_num=sum([float(x) for x in token_unit.split('-')])/len(token_unit.split('-'))
+            warning+='-token average'
+        except:
+            error+='-token average failed'
+    else:
+        try:
+            token_unit_num=float(token_unit)
+        except:
+            error+='-token error float'
+        if '-token error float' in error:   # try to remove . used as thousand separator
+            try:
+                token_unit_num=float(token_unit.replace('.000', '000'))
+                warning+='-token dot thousand separator removed'
+                error=error.replace('-token error float', '')
+            except:
+                pass
+            
+    currency_unit=None
+    currency_lab=None
+    currency_unit_num=None
+    currency_part=currency_part.replace(' ', '')
+    if len(currency_part) > 0:
+        # check if decimal is . or ,
+        if len(re.findall('[^0-9]0,', currency_part)) > 0 or currency_part.startswith('0,'):
+            currency_part=currency_part.replace('0,', '0.')
+        else:
+            currency_part=currency_part.replace(',', '')
+        currency_split=re.findall("(\d*\.?\d+|[A-Za-z]+)", currency_part)
+        letters_count=[sum([x.isalpha() for x in y]) for y in currency_split]
+        if len(currency_split) != 2:
+
+            lab_ind=[i for i, x in enumerate(letters_count) if x > 0]
+            check_lab=np.unique(np.array(currency_split)[lab_ind])
+            if len(check_lab) > 1:
+                error+='-currency range error multiple labels'
+            elif len(check_lab) == 0:
+                error+='-currency range error missing label'
+            else:
+                currency_lab=np.unique(np.array(currency_split)[lab_ind])[0]
+                currency_unit=currency_part.replace(currency_lab, '').replace(' ', '')
+                if '-' in currency_unit:    # price range -> take average
+                    try:
+                        currency_unit_num=sum([float(x) for x in currency_unit.split('-')])/len(currency_unit.split('-'))
+                        warning+='-currency average'
+                    except:
+                        error+='-currency range error float'
+
+        else:
+            number_ind=letters_count.index(min(letters_count))
+            lab_ind=letters_count.index(max(letters_count))
+            currency_lab=currency_split[lab_ind]
+            currency_unit=currency_split[number_ind].replace(' ', '')
+            if currency_unit.startswith('0,'):
+                currency_unit=currency_unit.replace('0,', '0.')
+            else:
+                currency_unit=currency_unit.replace(',', '')
+            try:
+                currency_unit_num=float(currency_unit)
+            except:
+                error+='-currency error float'
+            if '-currency error float' in error:   # try to remove . used as thousand separator
+                try:
+                    currency_unit_num=float(currency_unit.replace('.000', '000'))
+                    warning+='-currency dot thousand separator removed'
+                    error=error.replace('-token error float', '')
+                except:
+                    pass
+    
+    if token_unit_num is None:
+        error+='-missing token unit numeric'
+    if currency_unit_num is None:
+        error+='-missing currency unit numeric'
+        
+    
+    return pd.Series({'token_unit': token_unit, 'token_unit_num': token_unit_num,
+                      'currency_unit': currency_unit, 'currency_unit_num':currency_unit_num, 'currency_lab': currency_lab,
+                      'token_part': token_part, 'currency_part': currency_part, 'error': error[1:], 'warning': warning[1:]})
+
+
+def format_columns(format_df, cat_list=None, format_df_rows=0, results_folder=''):
+
+    #### format FundRaised
+
+
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cdrx', 'FundRaised']='19,000,000$'
+
+    print('\n** Formatting "FundRaised"')
+    missing_pre=sum(format_df['FundRaised']=='')
+    format_df['FundRaised']=format_df['FundRaised'].map(convert_fund)
+    format_df=format_df.rename(columns={'FundRaised': 'FundRaisedUSD'})
+    missing_post=format_df['FundRaisedUSD'].isna().sum()
+    if missing_pre != missing_post:
+        print(f'- FundRaisedUSD: expected missing: {missing_pre}  current missing: {missing_post}')
+    if format_df.shape[0] != format_df_rows:
+        print('########## "format_df" expected rows do not match')
+
+
+    #### extract continent and subregion from country
+
+    COUNTRY_MAPPING='.\\Data and papers\\country_to_continent.csv'  # https://worldpopulationreview.com/country-rankings/list-of-countries-by-continent
+    MANUAL_MAPPING=pd.DataFrame({'original': ['ZBG', 'UK', 'USA', 'Global', 'Holland', 'Austria/Romania',
+                                             'Delaware USA', 'CHE', 'Riga', 'UAE', 'Россия',
+                                             'Wordwide', 'Kosovo', 'Düsseldorf', 'UAE, USA', 'World', 'BVI',
+                                             'Amsterdam', 'London', 'Various', 'Latin America', 'England, UK',
+                                             'Worldwide', 'DUBAI', 'Polska', 'Türkiye', 'Dubai',
+                                             'UAE, Dubai', 'ShangHai', 'Toronto', 'Czechia', 'Scotland', 'Brasilia',
+                                             'usa', 'Swaziland', 'ENGLAND', 'International', 'Italia', 'England',
+                                             'Boulder, CO, San Francisco, CA, and Hyderabad, India', 'Slovak Republic',
+                                             'Dubai, United Emirates', 'Ukraine, Finland, India', 'India, Nigeria and US',
+                                             'USA, Canada, Philippines', 'US'],
+                               'new': ['Hong Kong', 'United Kingdom', 'United States', 'Worldwide', 'Netherlands', 'Austria',
+                                       'United States', 'Switzerland', 'Latvia', 'United Arab Emirates', 'Russia',
+                                      'Worldwide', 'Albania', 'Germany', 'United Arab Emirates', 'Worldwide', 'British Virgin Islands',
+                                      'Netherlands', 'United Kingdom', 'Worldwide', 'Brazil', 'United Kingdom',
+                                      'Worldwide', 'United Arab Emirates', 'Poland', 'Turkey', 'United Arab Emirates',
+                                      'United Arab Emirates', 'China', 'Canada', 'Czech Republic', 'United Kingdom', 'Brazil',
+                                      'United States', 'Eswatini', 'United Kingdom', 'Worldwide', 'Italy', 'United Kingdom',
+                                      'United States', 'Slovakia',
+                                      'United Arab Emirates', 'Ukraine', 'India',
+                                      'United States', 'United States']})
+
+    mapping=pd.read_csv(COUNTRY_MAPPING)[['country', 'region', 'subregion']].drop_duplicates()
+    mapping=pd.concat([mapping, pd.DataFrame({'country': 'Worldwide', 'region': 'All', 'subregion': 'All'}, index=[mapping.shape[0]])])
+    choices=mapping['country'].values.tolist()
+
+    print('\n** Formatting "Country"')
+    df_mapping=pd.DataFrame({'Country': format_df[format_df['Country'] != '']['Country'].unique()})
+    df_mapping['Country_adj']=df_mapping['Country']
+    for _, row in MANUAL_MAPPING.iterrows():
+        df_mapping['Country_adj'].replace(row['original'], row['new'], inplace=True)
+    df_mapping=df_mapping[df_mapping['Country_adj'] != '']
+    df_mapping[['country', 'accuracy']]=df_mapping['Country_adj'].apply(lambda x: pd.Series(process.extractOne(x, choices)))
+    print('- Mapped countries with low accuracy:')
+    display(df_mapping.query('accuracy < 90').sort_values(by='accuracy'))
+
+    format_df=format_df.merge((df_mapping.merge(mapping, on='country', how='left')[['Country', 'country', 'region', 'subregion']]
+                               .rename(columns={'region': 'Region', 'subregion': 'SubRegion', 'country': 'country_fixed'})), on='Country', how='left')
+    format_df[['Region', 'SubRegion']] = format_df[['Region', 'SubRegion']].fillna(value='')
+    move_col = format_df.pop('Region')
+    format_df.insert(format_df.columns.get_loc("Country")+1, 'Region', move_col)
+    move_col = format_df.pop('SubRegion')
+    format_df.insert(format_df.columns.get_loc("Region")+1, 'SubRegion', move_col)
+    move_col = format_df.pop('country_fixed')
+    format_df.insert(format_df.columns.get_loc("Country")+1, 'country_fixed', move_col)
+    format_df.rename(columns={'Country': 'CountryOriginal', 'country_fixed': 'Country'}, inplace=True)
+    if format_df.shape[0] != format_df_rows:
+        print('########## "format_df" expected rows do not match')
+
+
+    #### dummy for social media
+
+    print('\n** Formatting "SocialMedia"')
+    unique, counts = np.unique([item for sublist in format_df['SocialMedia'].dropna() for item in sublist], return_counts=True)
+    social_count=pd.DataFrame({'val': unique, 'count': counts}).sort_values(by='count', ascending=False)
+    print('- Counts for SocialMedia dummy:')
+    display(social_count)
+
+    df=format_df[['url', 'SocialMedia']].copy().dropna()
+    df_dummy=pd.DataFrame()
+    for _, row in df.iterrows():
+        dt=pd.get_dummies(row['SocialMedia'], drop_first=False, prefix='Social')
+        dt.insert(0, 'url', row['url'])
+        df_dummy=pd.concat([df_dummy, dt.groupby('url').sum()])
+    df_dummy=df_dummy.fillna(0).add_suffix('Dummy')
+    df_dummy.columns=df_dummy.columns.str.replace('_', '')
+    if df_dummy.max().max() > 1:
+        print('#### Warning: dummy for social media exceed 1')
+    social_lab=df_dummy.columns
+    df_dummy.reset_index(inplace=True)
+    format_df=format_df.merge(df_dummy, on='url', how='left').drop(columns=['SocialMedia'])
+    format_df[social_lab] = format_df[social_lab].fillna(value=0)
+    if format_df.shape[0] != format_df_rows:
+        print('########## "format_df" expected rows do not match')
+
+
+    #### convert Price to USD
+
+    CURRENCY_ADJUST=pd.DataFrame({'original': ['ETHER', 'ETHERS', 'EHT', 'XML', 'USDUSD', 'EURO', 'EUREUR', 'WAVE',
+                                               'USDBNB', 'USDBUSD', 'EH'],
+                                'adjusted': ['ETH', 'ETH', 'ETH', 'XLM', 'USD', 'EUR', 'EUR', 'WAVES',
+                                             'BNB', 'BUSD', 'ETH']})
+
+    format_df.loc[format_df['Ticker']=='YFNFT', 'ICOPrice']='0.05 USD'
+    format_df.loc[format_df['Ticker']=='YFNFT', 'TokenTotSupply']='73339 YFNFT'
+    format_df.loc[format_df['Ticker']=='PRO6, PSIX', 'IEOPrice']='0.075 USD'
+    format_df.loc[format_df['Ticker']=='ROX/ROX', 'ICOPrice']='0.05 USD'
+    format_df.loc[format_df['Ticker']=='BMBCoin', 'ICOPrice']='0.1 USD'
+    format_df.loc[format_df['Ticker']=='W2TW', 'ICOPrice']='0.65 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/blockchainaero', 'ICOPrice']='0.0002 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/abr', 'ICOPrice']='0.5 USD'
+    format_df.loc[format_df['Ticker']=='WISE', 'ICOPrice']='15 WISE = 1 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/asseta', 'Ticker']='AST'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/future-coin-light', 'Ticker']='FTC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/future-coin-light', 'Ticker']
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cointour', 'ICOPrice']='1 COT = 0.0001 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/portalverse', 'ICOPrice']='1 PORV = 10 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/floppa-token', 'ICOPrice']='$6.3 = 1000 FLOP'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/hybrid-betting', 'ICOPrice']='1 HYB = 0.17$'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bitcoincopy', 'ICOPrice']='0.31$ = BTCC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/izombie-universe', 'ICOPrice']='1 BNB = 5800 iZOMBIE'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/syndiqate', 'ICOPrice']='1 SQAT = $0.20'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/metacade', 'ICOPrice']='0.012 USDT = 1 MCADE'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/verifi-defi', 'ICOPrice']='$0.004'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/open-box-swap', 'ICOPrice']='1 OBOX= 0.0225 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/suapp', 'ICOPrice']='1 SUP =  0.025 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/onlycumies', 'ICOPrice']='1 BNB = 1,000,000 ONLYCUMIES'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/calvaria', 'ICOPrice']='1 USDT = 100.0 RIA'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/one-game', 'ICOPrice']='$0.0075 = OGT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/mcash-exchange-mbcash-ico', 'ICOPrice']='1 MBCash = $0.05'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/fightout', 'ICOPrice']='40 FGHT = 1 USDT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/yesil-token', 'ICOPrice']='$0.0020'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/digital-dollar', 'ICOPrice']='$0.10'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/juniverse-token', 'ICOPrice']='$1'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/calmoairphoenix', 'ICOPrice']='0.01 $'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/promodio', 'ICOPrice']='$0.005'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ocreata', 'ICOPrice']='1 BNB = 1,000,000 OCREATA'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/digital-euro', 'ICOPrice']='0.10 EUR'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/kaon', 'ICOPrice']='$0.0005'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/terrarium', 'ICOPrice']='1 TRM = 0.0005 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/blockapp', 'ICOPrice']='1 USDT = 1000 BAPP'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bellatrix-network', 'ICOPrice']='330,000 BTX = 1 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/gisc-loancoin-network', 'ICOPrice']='20,000 GISC LoanCoin/GIS = 1 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/astra', 'ICOPrice']='1 ETH = 1,000 STAR'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/nodis', 'ICOPrice']='NODIS = 0.1105 GA'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/sensing-exchange-capital', 'ICOPrice']='1 SEC == 0.00166 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/playrs', 'ICOPrice']='1 ETH = 4,000 PLAY'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/lucisdollar', 'ICOPrice']='1 BTC = 400000000 LUCD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/beuthereum', 'Ticker']='BCH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/lottechain', 'Ticker']='LEN'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/revenue-coin', 'ICOPrice']='1 RVC = 0.012 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/metadollar', 'ICOPrice']='1 USDME = $0.02'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/interledgerswap', 'ICOPrice']='1 BTC = 43049.896370 XRP'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/safemoonred', 'ICOPrice']='25000 SMR = 1 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bonzai-technology', 'ICOPrice']='3,750,000,000 BONZAI = 1 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/zeller', 'ICOPrice']='1 ZLR = 0.0000165012 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/monkeycola', 'ICOPrice']='1 MKC = 0.3 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/metarobotwarrior', 'ICOPrice']='1 MRTW = 0.0001 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/wordpool', 'ICOPrice']='500000 WORD = 1 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/metahex', 'ICOPrice']='1,000 MTX = 8 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/hive-power', 'ICOPrice']='1 ETH = 2432 HVT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/shibacute', 'ICOPrice']='1 BNB = 500000000000 SCUTE'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coin-for-nature', 'ICOPrice']='1 BNB = 3200000 COFN'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/flexq', 'ICOPrice']='1 BNB = 5210 FLQ'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/velic', 'ICOPrice']='0.01 VELT = 1 USDT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/civil', 'ICOPrice']='1 CIV = 0.0001 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/alsonft', 'ICOPrice']='1 AlsoNFT = 0.01 USDC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/wiki-simplify', 'ICOPrice']='1 WSY = 0.15 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/2021coin', 'ICOPrice']='0.64 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/clear-crystal-token', 'ICOPrice']='0.0001 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/romad-endpoint-defense', 'ICOPrice']='1 RBDT = 0.00288000 USDT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/crypto-market-ads', 'ICOPrice']='1 CMA coin = 0.01 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/custodi', 'ICOPrice']='0.60 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/micropad', 'ICOPrice']='0.075 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/neutro', 'IEOPrice']='1 NTO = 0.6 USDT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/genevieve-vc1518213868', 'ICOPrice']='1 GXVC = 0.10 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ixoracoin', 'ICOPrice']='1 BNB = 12,500,000 IXO'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/Apillon', 'IEOPrice']='0,40 $'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/earth-token', 'ICOPrice']='4000 ETN = 0.1 BTC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/wall-street-coin', 'ICOPrice']='1 WSC = 0.75 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/globetrotter', 'ICOPrice']='1 GTT = 0.20 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bluetherium', 'ICOPrice']=''
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/safecrypt', 'ICOPrice']='1 SFC =  0.00006 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/plaak', 'ICOPrice']='1 PLK = 1.4174 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/quanta-networks', 'ICOPrice']='1 QN = 0.70 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/true-gold-coin', 'ICOPrice']='1 TGC = 17.36 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/gauss-gang', 'ICOPrice']='1 GANG = 0.07 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/rpstoken', 'ICOPrice']='1 RPS= 0.000002 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/dragonnest', 'ICOPrice']='1 DRAGONNEST = 0.1 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/holiday', 'ICOPrice']='1 NEO = 1000 Holiday Coin'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ip-gold', 'ICOPrice']='1 IPG = 1 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/flexion', 'ICOPrice']='1 FXN = 0.025 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/zantepay', 'ICOPrice']='1 ZNX = 0.310000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/christ-coins', 'ICOPrice']='1 CCLC = 0.09 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coingrid', 'ICOPrice']='1 CGT = 0.044396 USD'
+
+
+    print('\n** Formatting "ICOPrice", "IEOPrice", "STOPrice"')
+    check_single_value_in_row=format_df[['ICOPrice','IEOPrice', 'STOPrice']].apply(lambda x: sum(x!=''), axis=1).max()
+    if check_single_value_in_row > 1:
+        print('- Rows with more than one "ICOPrice", "IEOPrice", "STOPrice"')
+    date_df=format_df[[col for col in format_df.columns if 'date' in col.lower()]].replace('TBA', '').replace(np.nan, '').fillna(pd.to_datetime('1 Jan 2150'))
+    date_df['RefDate']=date_df.apply(lambda x: min([y for y in x if type(y) != str]), axis=1)
+    # date_df.replace(pd.to_datetime('1 Jan 2150'), np.nan, inplace=True)
+    price_df=format_df[['url', 'Ticker', 'ICOPrice','IEOPrice', 'STOPrice']].copy()
+    price_df=pd.concat([price_df, date_df['RefDate']], axis=1)
+    price_df['RefDate']=price_df['RefDate'].dt.year.astype(str)+'_'+price_df['RefDate'].dt.month.astype(str).str.zfill(2)
+    price_df['RefDate'].replace('2150_01', 'last_avail', inplace=True)
+    price_df['Price']=price_df['ICOPrice']+price_df['IEOPrice']+price_df['STOPrice']
+    price_df=price_df[price_df['Price']!='']
+    price_df['check_split']=price_df.apply(lambda x: len(re.split('==|≈|=|—', x['Price'])), axis=1)
+    check_len=price_df.query('check_split > 2')
+    if check_len.shape[0] > 0:
+        print('- Found rows with wrong entries ("PriceUSD" will not be evaluated):')
+        display(check_len)
+        price_df=price_df[~price_df['url'].isin(check_len['url'].values)]
+    price_df=pd.concat([price_df, price_df.apply(extract_price, axis=1)], axis=1)
+    print('- Errors when parsing "ICOPrice", "IEOPrice", "STOPrice":')
+    display(price_df['error'].value_counts())
+    price_df.to_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_price_error_log.csv'), index=False, sep=';')
+    print('- Error log saved in', os.path.join(results_folder, '01c_ICOmarks_formatted_price_error_log.csv'))
+    price_df=price_df[price_df['error'] == '']
+    price_df['currency_lab']=price_df['currency_lab'].str.upper()
+    for i, row in CURRENCY_ADJUST.iterrows():
+        price_df['currency_lab'].replace(row['original'], row['adjusted'], inplace=True)
+    price_df=price_df.merge(cat_list[['url', 'StartDate']], on='url', how='left')  # check if "last_avail" is assigned only on TBA
+    if not (price_df[price_df['RefDate']=='']['StartDate'].unique()=='TBA').all():
+        print('- Warning: check missing "RefDate", "TBA" as date is automatically assigned and last available FX rate is taken')
+    # ETH-USD https://finance.yahoo.com/quote/ETH-USD/history
+    # BNB-USD https://finance.yahoo.com/quote/BNB-USD/history
+    # USDT-USD https://finance.yahoo.com/quote/USDT-USD/history
+    # BTC-USD https://finance.yahoo.com/quote/BTC-USD/history
+    # XLM-USD https://finance.yahoo.com/quote/XLM-USD/history
+    # TRX-USD https://finance.yahoo.com/quote/TRX-USD/history
+    # BUSD-USD https://finance.yahoo.com/quote/BUSD-USD/history
+    # KRW-USD https://finance.yahoo.com/quote/KRW-USD/history
+    # NEO-USD https://finance.yahoo.com/quote/NEO-USD/history
+    # MATIC-USD https://finance.yahoo.com/quote/MATIC-USD/history
+    # USDC-USD https://finance.yahoo.com/quote/USDC-USD/history
+    # WAVES-USD https://finance.yahoo.com/quote/WAVES-USD/history
+    # BTS-USD https://finance.yahoo.com/quote/BTS-USD/history
+    # VET-USD https://finance.yahoo.com/quote/VET-USD/history
+    # ICX-USD https://finance.yahoo.com/quote/ICX-USD/history
+    # LNC-USD https://finance.yahoo.com/quote/LNC-USD/history
+    # WETH-USD https://finance.yahoo.com/quote/WETH-USD/history
+    # DOT-USD https://finance.yahoo.com/quote/DOT-USD/history
+    # AVAX-USD https://finance.yahoo.com/quote/AVAX-USD/history
+    # AV-USD https://finance.yahoo.com/quote/AV-USD/history
+    # EUR-USD https://www.investing.com/currencies/eur-usd-historical-data
+    # GBP-USD https://www.investing.com/currencies/gbp-usd-historical-data
+    # CHF-USD https://www.investing.com/currencies/chf-usd-historical-data
+    # AUD-USD https://www.investing.com/currencies/aud-usd-historical-data
+    # SGD-USD https://www.investing.com/currencies/sgd-usd-historical-data
+    fx_df=pd.DataFrame()
+    # from yahoo finance
+    for file in ['ETH-USD', 'BNB-USD', 'USDT-USD', 'BTC-USD', 'XLM-USD', 'TRX-USD', 'BUSD-USD', 'KRW-USD', 'NEO-USD',
+                 'MATIC-USD', 'USDC-USD', 'WAVES-USD', 'BTS-USD', 'VET-USD', 'ICX-USD', 'LNC-USD', 'WETH-USD',
+                 'DOT-USD', 'AVAX-USD', 'AV-USD']:
+        dd=pd.read_csv(os.path.join('.\\Data and papers', file+'.csv'), parse_dates=['Date'])
+        dd.insert(0, 'currency_lab', file.replace('-USD', ''))
+        dd['RefDate']=dd['Date'].dt.year.astype(str)+'_'+dd['Date'].dt.month.astype(str).str.zfill(2)
+        dd['USDFx']=(dd['Open']+dd['Adj Close']) / 2
+        fx_df=pd.concat([fx_df, dd[['currency_lab', 'RefDate', 'USDFx']]])
+    # from investing.com
+    for file in ['CHF_USD Historical Data', 'EUR_USD Historical Data', 'GBP_USD Historical Data',
+                 'AUD_USD Historical Data', 'SGD_USD Historical Data']:
+        dd=pd.read_csv(os.path.join('.\\Data and papers', file+'.csv'), parse_dates=['Date'])
+        dd.insert(0, 'currency_lab', file.replace('_USD Historical Data', ''))
+        dd['RefDate']=dd['Date'].dt.year.astype(str)+'_'+dd['Date'].dt.month.astype(str).str.zfill(2)
+        dd['USDFx']=dd['Price']
+        fx_df=pd.concat([fx_df, dd[['currency_lab', 'RefDate', 'USDFx']]])    
+    fx_df=fx_df.groupby(['currency_lab', 'RefDate'], as_index=False).first()     # last month can have multiple values
+    fx_df=pd.concat([fx_df,
+                     (fx_df.sort_values(by='RefDate', ascending=False).groupby('currency_lab', as_index=False)
+                      .agg(USDFx=('USDFx', lambda x: x.head(36).mean())).assign(RefDate='last_avail'))])
+    # drop currency not included in fx
+    avail_curr=fx_df['currency_lab'].unique().tolist()+['USD']
+    remov=price_df[~price_df['currency_lab'].isin(avail_curr)].shape[0]
+    print(f'- {remov} rows removed because currency FX rate not available')
+    display(price_df[~price_df.currency_lab.isin(avail_curr)].currency_lab.value_counts())
+    price_df=price_df[price_df['currency_lab'].isin(avail_curr)]
+    # merge fx_df
+    price_df=price_df.merge(fx_df, on=['currency_lab', 'RefDate'], how='left')
+    price_df.loc[price_df['currency_lab'] == 'USD', 'USDFx']=1
+    approx_fx=price_df[price_df['USDFx'].isna()]
+    if approx_fx.shape[0] > 0:
+        print('- Taking closest available FX rate for', approx_fx.shape[0], 'rows. Currency:', approx_fx['currency_lab'].unique())
+        for i, row in approx_fx.iterrows():
+            date=pd.to_datetime(row['RefDate'], format='%Y_%m')
+            curr=row['currency_lab']
+            match_df=fx_df[(fx_df['currency_lab']==curr) & (fx_df['RefDate'] != 'last_avail')].copy()
+            match_df['Date']=pd.to_datetime(match_df['RefDate'], format='%Y_%m')
+            fx=match_df[match_df['Date'] == min(match_df['Date'], key=lambda x: (x>date, abs(x-date)))]['USDFx'].values[0]
+            price_df.loc[price_df['url']==row['url'], 'USDFx']=fx
+    if price_df['USDFx'].isna().sum() > 0:
+        print('-', price_df['USDFx'].isna().sum(), 'missing USD Fx rate found. Rows will be removed')
+        price_df=price_df[~price_df['USDFx'].isna()]
+    print(f'- Price available for {price_df.shape[0]} entries')
+    price_df.to_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_price_log.csv'), index=False, sep=';')
+    print('- Price log saved in', os.path.join(results_folder, '01c_ICOmarks_formatted_price_log.csv'))
+    # convert to USD
+    price_df['PriceUSD']=price_df['currency_unit_num'] / price_df['token_unit_num'] * price_df['USDFx']
+    if price_df['PriceUSD'].isna().sum() > 0 or price_df['PriceUSD'].isnull().sum() > 0:
+        print('- Warning: Inf or NaN rate found in "PriceUSD"')
+    # merge with format df
+    format_df=format_df.merge(price_df[['url', 'PriceUSD']], on='url', how='left')
+    move_col = format_df.pop('PriceUSD')
+    format_df.insert(format_df.columns.get_loc("STOPrice")+1, 'PriceUSD', move_col)
+    if format_df.shape[0] != format_df_rows:
+        print('########## "format_df" expected rows do not match')
+
+
+    #### convert PreSalePrice to USD
+
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bitether', 'PreSalePrice']='1 ETH = 615 BTT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/setcoin', 'PreSalePrice']='1 USD = 10 SET'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/sensitrust', 'PreSalePrice']='0.05 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/inmusik', 'PreSalePrice']='0.10 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/swapy-network', 'PreSalePrice']='0.57 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/phuket-holiday-coin', 'PreSalePrice']='1 PHC = 0.125 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/holiday', 'PreSalePrice']='1 NEO = 1500 Holiday Coin'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/immvrse', 'PreSalePrice']='0.20 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/linkercoin', 'PreSalePrice']='1 LNC  = 0.0003 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/metachessgame', 'PreSalePrice']='1 MTCG = $0.0035'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/floppa-token', 'PreSalePrice']='$5.4 = 1000 FLOP'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bonzai-technology', 'PreSalePrice']='4166666666 BONZAI = 1 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/lawrencium-token', 'PreSalePrice']='4000000 XLW = 1BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/renewable-energy-for-all', 'PreSalePrice']='14,000 REFA = 1 BSC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/zeller', 'PreSalePrice']='1 ZLR = 0.0000124198 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/metarobotwarrior', 'PreSalePrice']='1MRTW = 0.00005 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/neutro', 'PreSalePrice']='1 NTO = 0.6 USDT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/dlife', 'PreSalePrice']='1 DLIFE=$0.028'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ccecoin1541800979', 'PreSalePrice']='1 CCE = $0.10'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/miningwatchdog-smartchain-token', 'PreSalePrice']='$0.5 = 1 MSC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/the-sports-bet', 'PreSalePrice']='1 SBET = $0.0035'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/axl-inu', 'PreSalePrice']='$0.00075 = 1AXL'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/porn', 'PreSalePrice']='1 PORN = $ 0.006'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/mtw-games-token', 'PreSalePrice']='0.05 USDT = 1MTW'
+    # format_df.loc[format_df['url']=='', 'PreSalePrice']=''
+
+    print('\n** Formatting "PreSalePrice"')
+    price_df=format_df[['url', 'Ticker', 'PreSalePrice']].copy()
+    price_df=pd.concat([price_df, date_df['RefDate']], axis=1)
+    price_df['RefDate']=price_df['RefDate'].dt.year.astype(str)+'_'+price_df['RefDate'].dt.month.astype(str).str.zfill(2)
+    price_df['RefDate'].replace('2150_01', 'last_avail', inplace=True)
+    price_df['Price']=price_df['PreSalePrice']
+    price_df=price_df[price_df['Price']!='']
+    price_df['check_split']=price_df.apply(lambda x: len(re.split('==|≈|=|—', x['Price'])), axis=1)
+    check_len=price_df.query('check_split > 2')
+    if check_len.shape[0] > 0:
+        print('- Found rows with wrong entries ("PreSalePriceUSD" will not be evaluated):')
+        display(check_len)
+        price_df=price_df[~price_df['url'].isin(check_len['url'].values)]
+    price_df=pd.concat([price_df, price_df.apply(extract_price, axis=1)], axis=1)
+    print('- Errors when parsing "PreSalePrice":')
+    display(price_df['error'].value_counts())
+
+    price_df.to_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_PreSaleprice_error_log.csv'), index=False, sep=';')
+    print('- Error log saved in', os.path.join(results_folder, '01c_ICOmarks_formatted_PreSaleprice_error_log.csv'))
+    price_df=price_df[price_df['error'] == '']
+    price_df['currency_lab']=price_df['currency_lab'].str.upper()
+    for i, row in CURRENCY_ADJUST.iterrows():
+        price_df['currency_lab'].replace(row['original'], row['adjusted'], inplace=True)
+    price_df=price_df.merge(cat_list[['url', 'StartDate']], on='url', how='left')  # check if "last_avail" is assigned only on TBA
+    if not (price_df[price_df['RefDate']=='']['StartDate'].unique()=='TBA').all():
+        print('- Warning: check missing "RefDate", "TBA" as date is automatically assigned and last available FX rate is taken')
+    # drop currency not included in fx
+    avail_curr=fx_df['currency_lab'].unique().tolist()+['USD']
+    remov=price_df[~price_df['currency_lab'].isin(avail_curr)].shape[0]
+    print(f'- {remov} rows removed because currency FX rate not available')
+    price_df=price_df[price_df['currency_lab'].isin(avail_curr)]
+    # merge fx_df
+    price_df=price_df.merge(fx_df, on=['currency_lab', 'RefDate'], how='left')
+    price_df.loc[price_df['currency_lab'] == 'USD', 'USDFx']=1
+    approx_fx=price_df[price_df['USDFx'].isna()]
+    if approx_fx.shape[0] > 0:
+        print('- Taking closest available FX rate for', approx_fx.shape[0], 'rows. Currency:', approx_fx['currency_lab'].unique())
+        for i, row in approx_fx.iterrows():
+            date=pd.to_datetime(row['RefDate'], format='%Y_%m')
+            curr=row['currency_lab']
+            match_df=fx_df[(fx_df['currency_lab']==curr) & (fx_df['RefDate'] != 'last_avail')].copy()
+            match_df['Date']=pd.to_datetime(match_df['RefDate'], format='%Y_%m')
+            fx=match_df[match_df['Date'] == min(match_df['Date'], key=lambda x: (x>date, abs(x-date)))]['USDFx'].values[0]
+            price_df.loc[price_df['url']==row['url'], 'USDFx']=fx
+    if price_df['USDFx'].isna().sum() > 0:
+        print('-', price_df['USDFx'].isna().sum(), 'missing USD Fx rate found. Rows will be removed')
+        price_df=price_df[~price_df['USDFx'].isna()]
+    print(f'- Price available for {price_df.shape[0]} entries')
+    price_df.to_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_PreSaleprice_log.csv'), index=False, sep=';')
+    print('- Price log saved in', os.path.join(results_folder, '01c_ICOmarks_formatted_PreSaleprice_log.csv'))
+    # convert to USD
+    price_df['PreSalePriceUSD']=price_df['currency_unit_num'] / price_df['token_unit_num'] * price_df['USDFx']
+    if price_df['PreSalePriceUSD'].isna().sum() > 0 or price_df['PreSalePriceUSD'].isnull().sum() > 0:
+        print('- Warning: Inf or NaN rate found in "PreSalePriceUSD"')
+    # merge with format df
+    format_df=format_df.merge(price_df[['url', 'PreSalePriceUSD']], on='url', how='left')
+    move_col = format_df.pop('PreSalePriceUSD')
+    format_df.insert(format_df.columns.get_loc("PreSalePrice")+1, 'PreSalePriceUSD', move_col)
+    if format_df.shape[0] != format_df_rows:
+        print('########## "format_df" expected rows do not match')
+
+
+    #### convert Hard/Soft Cap
+
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/finebit-token', 'FundSoftCap']='500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/finebit-token', 'FundHardCap']='7000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/eshop', 'FundSoftCap']='500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/eshop', 'FundHardCap']='12000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cardonio', 'FundHardCap']='360000000 CFGT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cardonio', 'FundSoftCap']='220000000 CFGT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/masternode-invest', 'FundHardCap']='6500000 MS'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/united-farmers-x', 'FundHardCap']='205000000 UFX'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/123swap', 'FundHardCap']='40000000 123'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/konios-project', 'FundHardCap']='29000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/eddmate-token', 'FundHardCap']=''
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/smrt', 'FundHardCap']='53000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/yaffa', 'FundHardCap']='160000000 ENFT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ethichub', 'FundHardCap']='2,000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/aurora', 'FundHardCap']='5675200 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/levelnet', 'FundHardCap']='12000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/weekend-millionaires-club', 'FundHardCap']='2000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ebankx', 'FundHardCap']='78500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/baby-musk-coin', 'FundHardCap']='1544000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/x3-protocol', 'FundHardCap']='28890000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/mira', 'FundHardCap']='20000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/gameflip', 'FundHardCap']='12000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/beuthereum', 'FundHardCap']='8000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/altair-vr', 'FundHardCap']='10,000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/kiwilemon', 'FundHardCap']='USD 20000000'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/quanta-networks', 'FundHardCap']='300000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/iziing', 'FundHardCap']='30000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/stellerro', 'FundHardCap']='5000000 EUR'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/tellefinance', 'FundHardCap']='3500000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/digital-euro', 'FundHardCap']='100000000 EUR'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coinplace', 'FundHardCap']='20000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/fit-token', 'FundHardCap']='67000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/hut34-project', 'FundHardCap']='60000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/orfeus-network', 'FundHardCap']='50000 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/giga-giving', 'FundHardCap']='12000000 GC'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coinseed', 'FundHardCap']='1500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/hycon', 'FundSoftCap']='13900000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/gelios', 'FundSoftCap']='1000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ethichub', 'FundSoftCap']='1000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/levelnet', 'FundSoftCap']='1500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/ebankx', 'FundSoftCap']='1000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/baby-musk-coin', 'FundSoftCap']='1544000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/x3-protocol', 'FundSoftCap']='$28890000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/mira', 'FundSoftCap']='5000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/altair-vr', 'FundSoftCap']='500 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/healthureum', 'FundSoftCap']='15000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/kiwilemon', 'FundSoftCap']='5000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/quanta-networks', 'FundSoftCap']='20000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/iziing', 'FundSoftCap']='5000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/stellerro', 'FundSoftCap']='500000 EUR'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/digital-euro', 'FundSoftCap']='10000000 EUR'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/orfeus-network', 'FundSoftCap']='1000 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/libra-ecosystem', 'FundSoftCap']=''
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/libra-ecosystem', 'FundHardCap']=''
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/armacoin', 'FundHardCap']='2380000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/global-innovative-solutions', 'FundHardCap']='2100000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/aliencloud', 'FundHardCap']='600000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/citicash', 'FundHardCap']='19500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/copernic', 'FundHardCap']='3200000 PLN'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/edenbest', 'FundHardCap']='16875 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/edenbest', 'FundSoftCap']='11812 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/arealeum', 'FundHardCap']='73392857 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/bolton-coin-bfcl', 'FundHardCap']='2198960 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/chainpals', 'FundHardCap']='2425000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/sleekplay', 'FundHardCap']='26000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/x3-protocol', 'FundSoftCap']='28890000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/citicash', 'FundSoftCap']='5000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/escotoken', 'FundSoftCap']='16000 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/posschain', 'FundSoftCap']='1725000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/brickken', 'FundSoftCap']='500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/Metacoms', 'FundSoftCap']='500000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/flexion', 'FundHardCap']='5400000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/flexion', 'FundSoftCap']='900000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/flexion', 'FundHardCap']='2000 BNB'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/fanchain', 'FundHardCap']='330000000 FANZ'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/b-money', 'FundHardCap']='788190 BMNY'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/micropad', 'FundHardCap']='850000 MICROPAD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/custodi', 'FundHardCap']='35000000 Custodi Cash Token'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/fanchain', 'FundSoftCap']='50000000 FANZ'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/b-money', 'FundSoftCap']='118220 BMNY'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/micropad', 'FundSoftCap']='425000 MICROPAD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cakepad', 'FundSoftCap']='80000000 Cakepad'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coingrid', 'FundHardCap']='10000000 CGT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coingrid', 'FundSoftCap']='70000000 CGT'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cdrx', 'FundHardCap']='100000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/cdrx', 'FundSoftCap']='5000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coinchase', 'FundHardCap']='41900 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/coinchase', 'FundSoftCap']='400 ETH'
+
+    print('\n** Formatting "FundHardCap" and "FundSoftCap"')
+    date_df=format_df[[col for col in format_df.columns if 'date' in col.lower()]].replace('TBA', '').replace(np.nan, '').fillna(pd.to_datetime('1 Jan 2150'))
+    date_df['RefDate']=date_df.apply(lambda x: min([y for y in x if type(y) != str]), axis=1)
+    # date_df.replace(pd.to_datetime('1 Jan 2150'), np.nan, inplace=True)
+    price_df=format_df[['url', 'Ticker', 'FundHardCap', 'FundSoftCap']].copy()
+    price_df=pd.concat([price_df, date_df['RefDate']], axis=1)
+    price_df['RefDate']=price_df['RefDate'].dt.year.astype(str)+'_'+price_df['RefDate'].dt.month.astype(str).str.zfill(2)
+    price_df['RefDate'].replace('2150_01', 'last_avail', inplace=True)
+    price_df=pd.concat([price_df[['url', 'Ticker', 'RefDate', 'FundHardCap']].assign(type='FundHardCap').rename(columns={'FundHardCap': 'Price'}),
+              price_df[['url', 'Ticker', 'RefDate', 'FundSoftCap']].assign(type='FundSoftCap').rename(columns={'FundSoftCap': 'Price'})])
+    price_df=price_df[price_df['Price']!='']
+    price_df['check_split']=price_df.apply(lambda x: len(re.split('==|≈|=|—', x['Price'])), axis=1)
+    check_len=price_df.query('check_split > 2')
+    if check_len.shape[0] > 0:
+        print('- Found rows with wrong entries ("FundHardCap" or "FundSoftCap" will not be evaluated):')
+        display(check_len)
+        price_df=price_df[~price_df['url'].isin(check_len['url'].values)]
+    price_df=pd.concat([price_df, price_df.apply(extract_price, axis=1)], axis=1)
+    # try to recover missing currency from ICOPrice, IEOPrice, STOPrice
+    priceusd_df=pd.read_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_price_log.csv'), sep=';')
+    priceusd_df=priceusd_df[['url', 'currency_lab']].rename(columns={'currency_lab': 'currency_lab_PriceUSD'})
+    priceusd_df=pd.concat([priceusd_df.assign(type='FundHardCap'), priceusd_df.assign(type='FundSoftCap')])
+    row_exp=price_df.shape[0]
+    price_df=price_df.merge(priceusd_df, on=['url', 'type'], how='left')
+    price_df=price_df.merge(format_df[['url', 'PriceUSD', 'FundRaisedUSD']], on='url', how='left')
+    if price_df.shape[0] != row_exp:
+        print('###### warning: rows in "price_df" mismatch after join with "priceusd_df"')
+    # try to recover Price without currency label by currency_lab from PriceUSD
+    recov_df=price_df[(price_df['error']=='currency range error missing label-missing currency unit numeric') & (~price_df['currency_lab_PriceUSD'].isna())].copy()
+    if len(recov_df) > 0:
+        recov_df['Price']=recov_df['Price']+' '+recov_df['currency_lab_PriceUSD']
+        recov_df=recov_df[['url', 'Ticker', 'RefDate', 'Price', 'type', 'currency_lab_PriceUSD', 'PriceUSD', 'FundRaisedUSD']]
+        recov_df=pd.concat([recov_df, recov_df.apply(extract_price, axis=1)], axis=1)
+        recov_df=recov_df[recov_df['error']=='']
+        recov_df['warning']='currency recovered by PriceUSD'
+        price_df=price_df[~price_df.index.isin(recov_df.index)]
+        price_df=pd.concat([price_df, recov_df])
+    if price_df.shape[0] != row_exp:
+        print('###### warning: rows in "price_df" mismatch after join with "recov_df"')
+    price_df.loc[(price_df['error'] == 'missing currency unit numeric') & (price_df['currency_part'] == ''), 'error']=''
+    print('- Errors when parsing "FundHardCap" and "FundSoftCap":')
+    display(price_df['error'].value_counts())
+
+    price_df.to_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_HardSoftCap_error_log.csv'), index=False, sep=';')
+    print('- Error log saved in', os.path.join(results_folder, '01c_ICOmarks_formatted_HardSoftCap_error_log.csv'), end='\n')
+    price_df=price_df[price_df['error'] == '']
+    price_df['currency_lab']=price_df['currency_lab'].str.upper()
+    for i, row in CURRENCY_ADJUST.iterrows():
+        price_df['currency_lab'].replace(row['original'], row['adjusted'], inplace=True)
+    price_df=price_df.merge(cat_list[['url', 'StartDate']], on='url', how='left')  # check if "last_avail" is assigned only on TBA
+    if not (price_df[price_df['RefDate']=='']['StartDate'].unique()=='TBA').all():
+        print('- Warning: check missing "RefDate", "TBA" as date is automatically assigned and last available FX rate is taken')
+    ## evaluate Hard/SoftCap value in USD
+    only_token_df=price_df[(price_df['token_part'] != '') & (price_df['currency_part'] == '')].copy()
+    only_currency_df=price_df[(price_df['token_part'] == '') & (price_df['currency_part'] != '')].copy()
+    both_df=price_df[(price_df['token_part'] != '') & (price_df['currency_part'] != '')].copy()
+    ## only_token_df
+    if len(only_token_df) + len(only_currency_df) +len(both_df) != len(price_df):
+        print('- Warning: missing rows when splitting into "only_token_df", "only_currency_df" and "both_df"')
+    only_token_df['CapUSD']=only_token_df['token_unit_num']*only_token_df['PriceUSD']
+    if only_token_df.CapUSD.isna().sum() > 0:
+        print(f'- {only_token_df.CapUSD.isna().sum()} rows in "only_token_df" (with Hard/Soft Cap in tokens) skipped because of missing "PriceUSD"')
+    only_token_df=only_token_df[~only_token_df.CapUSD.isna()]
+    print(f'- {only_token_df.shape[0]} rows remaing in "only_token_df" (with Hard/Soft Cap in tokens)')
+    if only_token_df['CapUSD'].isna().sum() > 0 or only_token_df['CapUSD'].isnull().sum() > 0:
+        print('- Warning: Inf or NaN rate found in "CapUSD" in "only_token_df"')
+    ## only_currency_df
+    # drop currency not included in fx
+    avail_curr=fx_df['currency_lab'].unique().tolist()+['USD']
+    remov=only_currency_df[~only_currency_df['currency_lab'].isin(avail_curr)].shape[0]
+    if remov > 0:
+        print(f'- {remov} rows in "only_currency_df" (with Hard/Soft Cap in currency) skipped because FX rate not available')
+        display(price_df[~price_df.currency_lab.isin(avail_curr)].currency_lab.value_counts())
+    only_currency_df=only_currency_df[only_currency_df['currency_lab'].isin(avail_curr)]
+    # merge fx_df
+    only_currency_df=only_currency_df.merge(fx_df, on=['currency_lab', 'RefDate'], how='left')
+    only_currency_df.loc[only_currency_df['currency_lab'] == 'USD', 'USDFx']=1
+    approx_fx=only_currency_df[only_currency_df['USDFx'].isna()]
+    if approx_fx.shape[0] > 0:
+        print('- Taking closest available FX rate for', approx_fx.shape[0], 'rows. Currency:', approx_fx['currency_lab'].unique())
+        for i, row in approx_fx.iterrows():
+            date=pd.to_datetime(row['RefDate'], format='%Y_%m')
+            curr=row['currency_lab']
+            match_df=fx_df[(fx_df['currency_lab']==curr) & (fx_df['RefDate'] != 'last_avail')].copy()
+            match_df['Date']=pd.to_datetime(match_df['RefDate'], format='%Y_%m')
+            fx=match_df[match_df['Date'] == min(match_df['Date'], key=lambda x: (x>date, abs(x-date)))]['USDFx'].values[0]
+            only_currency_df.loc[only_currency_df['url']==row['url'], 'USDFx']=fx
+    if only_currency_df['USDFx'].isna().sum() > 0:
+        print('-', only_currency_df['USDFx'].isna().sum(), 'missing USD Fx rate found. Rows will be removed')
+        only_currency_df=only_currency_df[~only_currency_df['USDFx'].isna()]
+    print(f'- {only_currency_df.shape[0]} rows remaing in "only_currency_df" (with Hard/Soft Cap in currency)')
+    # convert to USD
+    only_currency_df['CapUSD']=only_currency_df['currency_unit_num'] * only_currency_df['USDFx']
+    if only_currency_df['CapUSD'].isna().sum() > 0 or only_currency_df['CapUSD'].isnull().sum() > 0:
+        print('- Warning: Inf or NaN rate found in "CapUSD" in "only_currency_df"')
+    ## both_df
+    if len(both_df) > 0:
+        print(f'- All {len(both_df)} rows in "both_df" (with Hard/Soft Cap in currency AND token) skipped because of mismatch')
+
+    price_df=pd.concat([only_currency_df, only_token_df])
+    print(f'\n- Hard/Soft Cap available for {price_df.shape[0]} entries')
+    price_df.to_csv(os.path.join(results_folder, '01c_ICOmarks_formatted_HardSoftCap_log.csv'), index=False, sep=';')
+    print('- Price log saved in', os.path.join(results_folder, '01c_ICOmarks_formatted_HardSoftCap_log.csv'))
+    # merge with format df
+    rows=price_df.shape[0]
+    price_df=price_df[['url', 'type', 'CapUSD']].pivot(index='url',columns='type',values='CapUSD').reset_index().rename(columns={'FundHardCap': 'FundHardCapUSD', 'FundSoftCap': 'FundSoftCapUSD'})
+    if len(price_df) * 2 - price_df.drop(columns='url').isna().sum().sum() != rows:
+        print('###### warning: spreading price_df generated unexpected missing')
+    format_df=format_df.merge(price_df[['url', 'FundHardCapUSD', 'FundSoftCapUSD']], on='url', how='left')
+    move_col = format_df.pop('FundHardCapUSD')
+    format_df.insert(format_df.columns.get_loc("FundHardCap")+1, 'FundHardCapUSD', move_col)
+    move_col = format_df.pop('FundSoftCapUSD')
+    format_df.insert(format_df.columns.get_loc("FundSoftCap")+1, 'FundSoftCapUSD', move_col)
+    if format_df.shape[0] != format_df_rows:
+        print('########## "format_df" expected rows do not match')
+
+    return format_df
