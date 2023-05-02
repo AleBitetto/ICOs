@@ -10,11 +10,13 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import NoAlertPresentException
 import shutil
 import time
+from timeit import default_timer as timer
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.common.action_chains import ActionChains
 import pandas as pd
 import numpy as np
 import requests
+import joblib
 from bs4 import BeautifulSoup
 from soup2dict import convert
 import datetime
@@ -25,11 +27,17 @@ import pytesseract
 from PIL import Image
 from tika import parser
 from thefuzz import process
+import json
+from urllib.parse import urljoin
+import torch
+from transformers import BertTokenizer, BertForSequenceClassification
+from termcolor import colored
 
 
 
 def get_chromedriver(chromedriver_path=None, use_proxy=False, user_agent=None,
-                    PROXY_HOST=None, PROXY_PORT=None, PROXY_USER=None, PROXY_PASS=None, download_folder=None):
+                    PROXY_HOST=None, PROXY_PORT=None, PROXY_USER=None, PROXY_PASS=None, download_folder=None,
+                    desired_capabilities=None):
 
     manifest_json = """
     {
@@ -102,7 +110,8 @@ def get_chromedriver(chromedriver_path=None, use_proxy=False, user_agent=None,
     chrome_options.add_experimental_option("prefs", prefs_experim)
     driver = webdriver.Chrome(
         executable_path=chromedriver_path,
-        chrome_options=chrome_options)
+        chrome_options=chrome_options,
+        desired_capabilities=desired_capabilities)
     return driver
 
 
@@ -223,6 +232,26 @@ def adjust_date(x):
         x=x[0]
         
     return x
+
+
+def eval_duration(x):
+    
+    duration=None
+    if x['StartDate'] not in ['TBA', '']:
+        try:
+            max_date=pd.to_datetime(x['ListDownloadedOn'], format="%d/%m/%Y")
+            start=pd.to_datetime(x['StartDate'])
+            end=pd.to_datetime(x['EndDate']) if x['EndDate'] not in ['TBA', ''] else pd.to_datetime('1 Jan 2150')
+            duration=min([end, max_date])-start
+            if duration.days < 0:
+                duration=-99
+            else:
+                duration=np.log10(duration.days + 1)   # avoid log(0)
+        except:
+            duration=-99
+            print(f'#### wrong date on index {x.name}: {x.StartDate} or {x.EndDate}')
+    
+    return(duration)
 
 
 def get_social_series(url='', tot_series=1, chromedriver_path=''):
@@ -882,9 +911,9 @@ def extract_price(row):
     error=''
     warning=''
     ticker=row['Ticker']
-    price=(row['Price'].replace('$', 'USD').replace('€', 'EUR').replace('\u200b', '').replace('~', '')
-           .replace('00.000', '00000').replace('.000.000', '000000').replace('0.000.000', '0000000')
-           .replace('00.000.000', '00000000').replace('.000.000.000', '000000000'))
+    price=(row['Price'].replace('$', 'USD').replace('€', 'EUR').replace('\u200b', '').replace('~', '')           
+           .replace('.000.000.000', '000000000').replace('00.000.000', '00000000').replace('0.000.000', '0000000')
+             .replace('.000.000', '000000').replace('00.000', '00000'))
     
     # split token and currency
     if ticker == '':
@@ -1493,6 +1522,8 @@ def format_columns(format_df, cat_list=None, format_df_rows=0, results_folder=''
     format_df.loc[format_df['url']=='https://icomarks.com/ico/cdrx', 'FundSoftCap']='5000000 USD'
     format_df.loc[format_df['url']=='https://icomarks.com/ico/coinchase', 'FundHardCap']='41900 ETH'
     format_df.loc[format_df['url']=='https://icomarks.com/ico/coinchase', 'FundSoftCap']='400 ETH'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/dago-mining', 'FundHardCap']='20000000 USD'
+    format_df.loc[format_df['url']=='https://icomarks.com/ico/dago-mining', 'FundSoftCap']='4000000 USD'
 
     print('\n** Formatting "FundHardCap" and "FundSoftCap"')
     date_df=format_df[[col for col in format_df.columns if 'date' in col.lower()]].replace('TBA', '').replace(np.nan, '').fillna(pd.to_datetime('1 Jan 2150'))
@@ -1628,3 +1659,217 @@ def set_global_logging_level(level=logging.ERROR, prefices=[""]):
     for name in logging.root.manager.loggerDict:
         if re.match(prefix_re, name):
             logging.getLogger(name).setLevel(level)
+            
+            
+def query(payload, api_url, headers):
+    data = json.dumps(payload)
+    response = requests.request("POST", api_url, headers=headers, data=data)
+    return json.loads(response.content.decode("utf-8"))
+
+
+def format_results(query_output):
+    res=pd.DataFrame()
+    for index, x in enumerate(query_output):
+        row=pd.DataFrame()
+        for y in x:
+            row=pd.concat([row, pd.DataFrame({y['label']: [y['score']]})], axis=1)
+        row.insert(0, 'max', row.idxmax('columns'))
+        res=pd.concat([res, row])
+    return res
+
+
+def chunk_sentence(sentence_list=[], tokenizer=None, max_length=0, rolling_window_perc=0.7):
+    
+    '''
+    Split each sentence in sentence_list into chunks of max_length-6 with a rolling window of
+    int(rolling_window_perc*max_length) so as to have a (1-rolling_window_perc)*max_length words' overlap
+    between consecutive chunks. Each chunk is evaluated according to the corresponding tokens (may be more than
+    total words in sentence) encoded by "tokenizer". Then tokens are decoded back to string so as to be ready
+    to be processed by HuggingFace API, avoiding "Input is too long" error in the query.
+    
+    Args:
+        - sentence_list: (list) list of sentence to be splitted
+        - tokenizer: tokenizer such as BertTokenizer.from_pretrained()
+        - max_length: (int) maximum number of token that can be processed by model
+        - rolling_window_perc: (float in [0, 1]) percentage of "max_length" to be used as step for the rolling window.
+                                (1-rolling_window_perc) will result into the number of words that overlap in each chunk.
+    '''
+    
+    set_global_logging_level(logging.ERROR)   # silence warning for exceeding max_length in tokenizer
+
+    reference_index=[]
+    sentence_chunks=[]
+    for index, txt in enumerate(sentence_list):
+
+        print('Processing ' + str(index + 1) + ' / ' + str(len(sentence_list)), end = '\r')
+        
+        # tokenize
+        tk=tokenizer.encode_plus(txt, add_special_tokens=False, return_tensors='pt')
+        tokens=tk['input_ids'][0]
+
+        # split into overlapping chunks
+        max_ind=len(tokens)-1
+        window_size=max_length-6
+        window_step=int(rolling_window_perc*max_length)
+        token_chunks_ind=[]
+        i=0
+        while True:
+            cnk=list(range(i*window_step, min([i*window_step+window_size, len(tokens)])))
+            token_chunks_ind.append(cnk)
+            i+=1
+            if max(cnk) == max_ind:
+                break
+        if np.in1d(np.array([[x[0], x[-1]] for x in token_chunks_ind]).ravel(), [0, max_ind]).sum() != 2: # check skipped start/end of sentence
+            print(f'- Index {index}: token chunk index do not contain start and/or end of sentence')
+
+        # decode back to sentence
+        for ind in token_chunks_ind:
+            sentence_chunks.append(tokenizer.decode(tokens[ind]))
+
+        # store reference index to map each chunk to corresponding original sentence
+        reference_index.extend([str(index).zfill(6)+'_'+str(i) for i in range(len(token_chunks_ind))]) # index_ChunkNum
+        
+    set_global_logging_level(logging.WARNING)
+    if len(reference_index) != len(sentence_chunks):
+        print('\n##### Warning: "reference_index" has different length from "sentence_chunks"')
+    
+    return reference_index, sentence_chunks
+
+
+def sentence_classification(df_text, model_ID_list=[''], rolling_window_perc=0.7, query_batch_size=50, split_reload=False,
+                            query_reload=False, cache_dir='', api_url='', headers=None, checkpoint_folder='', sentiment_folder=''):
+    
+    '''
+    Evaluate text classification on sentences and returns class probabilities.
+    
+    Args:
+        - model_ID_list: (list of str) HuggingFace model ID. E.g. 'nbroad/ESG-BERT'
+        - rolling_window_perc: (float in [0, 1]) see chunk_sentence()
+        - query_batch_size: (int) batch size of sentences to be sent to API
+        - split_reload: (bool) if True reload the splitting of sentences into chunks by chunk_sentence()
+        - cache_dir: (str) path for caching HuggingFace model (model will be downloaded if not found in the folder)
+        - api_url: (str) url for HuggingFace API. Will be merged with model_ID
+        - headers: (dict) headers used for the API to pass the API token
+    '''
+
+    if type(model_ID_list) != list:
+        raise ValueError('"model_ID_list" must be a list of string')
+    
+    output={}
+    for model_ID in model_ID_list:
+        
+        print('\n\n'+'#'*(70+len(model_ID)+4))
+        print('#'+' '*35, model_ID, ' '*35+'#')
+        print('#'*(70+len(model_ID)+4),'\n\n')
+        model_lab=model_ID.replace('/','_')
+    
+        ### define model and tokenizer
+        model = BertForSequenceClassification.from_pretrained(model_ID, cache_dir=cache_dir)
+        tokenizer = BertTokenizer.from_pretrained(model_ID, do_lower_case=True, cache_dir=cache_dir)
+
+        ### get prediction classe, special tokens and maximum sentence (in tokens) length
+        # https://huggingface.co/transformers/v4.0.1/model_doc/bert.html?highlight=do_lower_case#berttokenizer
+
+        pred_classes=model.config.id2label
+        print('Prediction classes:')
+        display(pd.DataFrame(pred_classes.values(), index=pred_classes.keys(), columns=['Class']))
+
+        max_length = model.config.max_position_embeddings
+        print('\nMaximum tokens allowed:', max_length)
+
+        # get input_ids coding for "PAD". CLS will always be at the beginning, SEP at the end
+        tk = tokenizer("[PAD]", truncation=False)
+        token_CLS = tk['input_ids'][0]     # beginning of sentence, CLS for classification
+        token_PAD = tk['input_ids'][1]
+        token_SEP = tk['input_ids'][2]
+        tk=tokenizer("[UNK]", truncation=False)
+        token_UNK = tk['input_ids'][1]
+        print('\nSpecial Tokens:\n[PAD]:', token_PAD , '\n[CLS]:', token_CLS, '\n[SEP]:', token_SEP, '\n[UNK]:', token_UNK)
+
+        ### split the sentences into chunks
+        print('\n\n-- Split sentences into chunks:\n')
+        split_path=os.path.join(checkpoint_folder, '00_sentence_split_'+model_lab+'.pkl')
+        if not split_reload or not os.path.exists(split_path):
+            start=timer()
+            reference_index, sentence_chunks = chunk_sentence(sentence_list=df_text['text_clean'],
+                                                              tokenizer=tokenizer, max_length=max_length, rolling_window_perc=0.7)
+            tot_time=str(datetime.timedelta(seconds=round(timer()-start)))
+            joblib.dump({'reference_index': reference_index, 'sentence_chunks': sentence_chunks, 'tot_time': tot_time},
+                        split_path, compress=('lzma', 3))
+            print('\nDone in ', tot_time)
+            print('Data saved in', split_path)
+        else:
+            rr=joblib.load(split_path)
+            reference_index=rr['reference_index']
+            sentence_chunks=rr['sentence_chunks']
+            tot_time=rr['tot_time']
+            print(f'Reloaded (evaluated in {tot_time})')
+        print(f'\nTotal sentences: {len(df_text)}')
+        print(f'Total chunked sentences: {len(reference_index)}')
+
+
+        ### query from API
+        print('\n\n-- Query from API:\n')
+        chunk_ind=[list(range(len(reference_index)))[i:i + query_batch_size] for i in range(0, len(reference_index), query_batch_size)]
+        query_log=pd.DataFrame()
+        for i, ind in enumerate(chunk_ind):
+
+            message=f'Querying batch ({query_batch_size} rows) {str(i + 1)} / {str(len(chunk_ind))}  last interaction: {datetime.datetime.now().strftime("%d/%m/%Y %H:%M:%S")}'
+            print(message, end = '\r')
+
+            chunck_path=os.path.join(sentiment_folder, 'sentence_query_'+model_lab+'_'+str(i)+'.pkl')
+            if not query_reload or not os.path.exists(chunck_path):
+
+                ref_ind=np.array(reference_index)[ind].tolist()
+                text_batch=np.array(sentence_chunks)[ind].tolist()
+
+                start=timer()
+                max_try=1
+                while max_try <= 2:
+                    try:
+                        query_out=query({"inputs": text_batch, "options": {"wait_for_model": True}},
+                                        api_url=urljoin(api_url, model_ID), headers=headers)
+
+                        if type(query_out)!=list and 'error' in query_out.keys():
+                            query_out=pd.DataFrame({'Status': 'FAILED', 'Error': query_out['error'], 'ref_index': ref_ind})
+                        else:
+                            query_out=format_results(query_out)
+                            query_out.insert(0, 'ref_index', ref_ind)
+                            query_out.insert(0, 'Error', '')
+                            query_out.insert(0, 'Status', 'OK')
+                            break
+                    except Exception as e:
+                        query_out=pd.DataFrame({'Status': 'FAILED', 'Error': e, 'ref_index': ref_ind})
+                    max_try+=1
+
+                query_out.insert(0, 'Chunk', i)
+                match_url=(pd.DataFrame([int(x.split('_')[0]) for x in ref_ind], columns=['index'])
+                           .merge(df_text[['url']].reset_index(), on='index', how='left')).pop('url')
+                query_out.insert(0, 'url', match_url.values)
+                query_out['eval_time']=datetime.timedelta(seconds=round(timer()-start)).total_seconds()
+                if len(query_out[query_out['Status']=='FAILED']) == 0:
+                    query_out.to_pickle(chunck_path, protocol=-1)
+            else:
+                query_out=pd.read_pickle(chunck_path)
+
+            query_log=pd.concat([query_log, query_out])
+            query_path_csv=os.path.join(checkpoint_folder, '00_sentence_query_'+model_lab+'.csv')
+            query_log.to_csv(query_path_csv, index=False, sep=';')
+            tot_fail_batch=query_log[query_log['Status'] == 'FAILED']['Chunk'].nunique()
+            tot_fail_rows=(query_log['Status'] == 'FAILED').sum()
+            print(message+f'  - total failed batch: {tot_fail_batch} ({tot_fail_rows} rows)', end = '\r')
+            
+        query_log.insert(0, 'Model', model_ID)
+        display(query_log['Status'].value_counts().to_frame())
+        if len(query_log[query_log['Status'] == 'FAILED']) > 0:
+            print(colored('Try to run the code again with', 'black', 'on_light_grey'),
+                  'query_reload='+colored('True', 'green',  attrs=['bold']))
+        output[model_lab]=query_log
+
+        tot_time=query_log.groupby('Chunk').first()['eval_time'].sum()
+        print('\nDone in ', str(datetime.timedelta(seconds=round(tot_time))))
+        query_path=os.path.join(checkpoint_folder, '00_sentence_query_'+model_lab+'.pkl')
+        query_log.to_pickle(query_path, protocol=-1)
+        print('Data saved in', query_path)
+        
+    return output
