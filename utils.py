@@ -1,18 +1,20 @@
 import os
 import zipfile
-from selenium import webdriver
+# from selenium import webdriver
+from seleniumwire import webdriver
+from seleniumwire.utils import decode
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.support.ui import Select
+from selenium.webdriver.chrome.service import Service
 from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import NoAlertPresentException
 import shutil
 import time
 from timeit import default_timer as timer
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
 import pandas as pd
 import numpy as np
 import requests
@@ -32,12 +34,13 @@ from urllib.parse import urljoin
 import torch
 from transformers import BertTokenizer, BertForSequenceClassification
 from termcolor import colored
+from totaltimeout import Timeout
 
 
 
 def get_chromedriver(chromedriver_path=None, use_proxy=False, user_agent=None,
                     PROXY_HOST=None, PROXY_PORT=None, PROXY_USER=None, PROXY_PASS=None, download_folder=None,
-                    desired_capabilities=None):
+                    desired_capabilities=None, return_options_only=False):
 
     manifest_json = """
     {
@@ -108,11 +111,16 @@ def get_chromedriver(chromedriver_path=None, use_proxy=False, user_agent=None,
         prefs_experim["download.default_directory"] = download_folder
 
     chrome_options.add_experimental_option("prefs", prefs_experim)
-    driver = webdriver.Chrome(
-        executable_path=chromedriver_path,
-        chrome_options=chrome_options,
-        desired_capabilities=desired_capabilities)
-    return driver
+
+    if return_options_only:
+        return chrome_options
+    else:
+        driver = webdriver.Chrome(
+            service=Service(chromedriver_path), # executable_path=chromedriver_path,
+            options=chrome_options,
+            desired_capabilities=desired_capabilities)
+        
+        return driver
 
 
 def pdf_to_text(file_path='', tesseract_path='', lang='eng'):
@@ -254,35 +262,86 @@ def eval_duration(x):
     return(duration)
 
 
-def get_social_series(url='', tot_series=1, chromedriver_path=''):
+def get_social_series(driver=None, tot_series=1):
     
     # https://levelup.gitconnected.com/trickycases-6-scrape-highcharts-plots-a6b3fc233fe6
     
-    driver = get_chromedriver(chromedriver_path=chromedriver_path)
-    driver.get(url)
     series_dict={}
+    status=''
     try:
         WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CLASS_NAME, "highcharts-container ")))
-
-        for i in range(tot_series):            
-            cmd='return Highcharts.charts[0].series['+str(i)+']'
-            series_name=driver.execute_script(cmd+'.name')
-            dates = driver.execute_script(cmd+'.data.map(x => x.series).map(x => x.xData)[0].map(x => new Date(x).toISOString())')
-            values = driver.execute_script(cmd+'.data.map(x => x.series).map(x => x.yData)[0]')
-
-            series_dict[series_name]=pd.DataFrame({'Date': dates, 'Users': values})
     except:
-        pass
+        status='DOWNLOAD_NOT_AVAILABLE'
+    else:
+        try:
+            for i in range(tot_series):            
+                cmd='return Highcharts.charts[0].series['+str(i)+']'
+                series_name=driver.execute_script(cmd+'.name')
+                dates = driver.execute_script(cmd+'.data.map(x => x.series).map(x => x.xData)[0].map(x => new Date(x).toISOString())')
+                values = driver.execute_script(cmd+'.data.map(x => x.series).map(x => x.yData)[0]')
 
-    driver.close()
+                series_dict[series_name]=pd.DataFrame({'Date': dates, 'Users': values})
+        except:
+            status='DOWNLOAD_ERROR'
 
-    return series_dict
+    return status, series_dict
 
 
-def scrape_info_icomarks(url='', chromedriver_path='', skip_social=False):
+def get_price_series(driver=None):
+
+    status=''
+    count=0
+    try:
+        valueToClick = "All"
+        button = driver.find_element('xpath',
+                                     '//div[@class="companyGraph"]//div[@class="highcharts-container "]//*[name()="g" and '
+                                     f'@class="highcharts-range-selector-group"]//*[name()="text" and text()="{valueToClick}"]')
+    except:
+        status='DOWNLOAD_NOT_AVAILABLE'
+    else:
+        try:
+            button.click()
+
+            status='DOWNLOADED'
+            multiple_series=[]
+            multiple_data=[]
+            for request in driver.requests:
+                if request.response:
+                    if 'https://icomarks.com/graph/prices?' in request.url:
+                        body = decode(request.response.body, request.response.headers.get('Content-Encoding', 'identity'))
+                        data=json.loads(body)
+                        multiple_data.append(data)
+                        multiple_series.append(int(data['total']))
+                        count+=1
+        except:
+            status='DOWNLOAD_ERROR'
+
+    series_df=None
+    if count > 0:
+        data=multiple_data[np.argmax(multiple_series)]
+        for col in ['prices', 'market_cap', 'h24_vol']:
+            df_t=pd.DataFrame(data[col], columns =['Date', col])
+            df_t['Date']=pd.to_datetime(df_t['Date'], unit='ms')
+            if series_df is not None:
+                series_df=series_df.merge(df_t, on='Date', how='left')
+            else:
+                series_df=df_t
+        series_df.columns=['Date', 'PriceUSD', 'MarketCap', 'Volume24H']
+    if count > 1 and len(set(multiple_series)) > 1:
+        status='DOWNLOADED_BUT_MULTIPLE_SERIES'
+    if series_df is None:
+        series_df=pd.DataFrame()
+        
+    return status, series_df
+
+
+def scrape_info_icomarks(url='', chromedriver_path='', skip_social=False, skip_price=False):
     
     '''
     - skip_social: if True skip social users' timeseries download (takes time and uses WebDriver)
+    - skip_price: if True skip market price timeseries download (takes time and uses WebDriver)
+    
+    Better to allow or deny both.
     '''
     
     add_row=pd.DataFrame()
@@ -321,7 +380,6 @@ def scrape_info_icomarks(url='', chromedriver_path='', skip_social=False):
                     ind=np.where([x['@class'] == ['ico-rating__circle'] for x in t['div']])[0][0]
                     value=t['div'][ind]['#text']
                     add_row['Rating_'+name.replace(' ', '_')]=[value]
-
 
 
     #### extract "Detail" tab blocks
@@ -384,7 +442,7 @@ def scrape_info_icomarks(url='', chromedriver_path='', skip_social=False):
         ind=np.where([x['@href'] == '#team' for x in conv_dict['a']])[0][0]
         team_size=int(conv_dict['a'][ind]['#text'].replace('Team (', '').replace(')', ''))
         # check if Advisors
-        advisor_size=int(soup.findAll(text = re.compile('Advisors \('))[0].replace('Advisors (', '').replace(')', ''))
+        advisor_size=int(soup.find_all(string = re.compile('Advisors \('))[0].replace('Advisors (', '').replace(')', ''))
         loop_max = 2 if advisor_size != 0 else 1
         # extract Team and Advisors
         tag = soup.find_all('div', class_='company-team', recursive=True)
@@ -440,8 +498,10 @@ def scrape_info_icomarks(url='', chromedriver_path='', skip_social=False):
         
         # download chart data
         if not skip_social:
-            series_dict=get_social_series(url=url, tot_series=social_df.shape[0], chromedriver_path=chromedriver_path)
-            series_status = 'DOWNLOADED' if len(series_dict) != 0 else 'DOWNLOAD_ERROR'
+            driver = get_chromedriver(chromedriver_path=chromedriver_path)
+            driver.get(url)
+            series_status, series_dict=get_social_series(driver=driver, tot_series=social_df.shape[0])
+            series_status = 'DOWNLOADED' if len(series_dict) != 0 else series_status
         else:
             series_dict={}
             series_status='DOWNLOAD_SKIPPED'
@@ -449,6 +509,27 @@ def scrape_info_icomarks(url='', chromedriver_path='', skip_social=False):
         add_row['SocialWithRating']=social_df.shape[0]
         add_row['SocialSeriesStatus']=series_status
         add_row['SocialBlock']=[[{'stats': social_df, 'timeseries': series_dict}]]
+    else:
+        add_row['SocialSeriesStatus']='SOCIAL_TAB_MISSING'
+        
+    
+    #### Get Market Price timeseries
+    
+    if not skip_price:
+        if 'driver' not in locals():
+            driver = get_chromedriver(chromedriver_path=chromedriver_path)
+            driver.get(url)
+        series_status, series_df=get_price_series(driver)
+    else:
+        series_status='DOWNLOAD_SKIPPED'
+        series_df=None
+        
+    add_row['MarketPriceSeriesStatus']=series_status
+    add_row['MarketPriceSeries']=[series_df]
+            
+     
+    if 'driver' in locals():
+        driver.close()
         
     return add_row
 
@@ -659,6 +740,9 @@ def extract_scaping_icomarks(scrape_df):
 
             #### unpack Social Media tab
 
+            social_series = 1 if row['SocialSeriesStatus'] == 'DOWNLOADED' else 0
+            add_row['SocialSeriesDownloaded']=social_series
+            
             blk_soc=block_df[block_df['BlockName'] == 'Social media']
             media_list=None
             if len(blk_soc) > 0:
@@ -678,11 +762,19 @@ def extract_scaping_icomarks(scrape_df):
     #                 blk_soc=row['SocialBlock']
     #                 stats=blk_soc[0]
     #                 timeseries_dict=blk_soc[0]['timeseries']
-    #                 # todo: si possono calcolare medie, dev stand, ecc
+    #                 # todo: si possono calcolare medie, dev standard , ecc
     #         else:
     #             track_social=None
 
     #         add_row['TrackedSocial']=track_social
+    
+    
+            #### unpack Trading Price data
+
+            price_series = 1 if row['MarketPriceSeriesStatus'] == 'DOWNLOADED' else 0
+            add_row['PriceSeriesDownloaded']=price_series
+            
+            # todo: si possono calcore medie, dev standard, ecc
 
             df_final=pd.concat([df_final, add_row])
 
@@ -1873,3 +1965,240 @@ def sentence_classification(df_text, model_ID_list=[''], rolling_window_perc=0.7
         print('Data saved in', query_path)
         
     return output
+
+
+def scrape_coinmarketcap(row=None, add_row=None, skip_download=False, check_cookies=False,
+                         chromedriver_path='', price_folder='', screenshot_folder=''):
+    
+    '''
+    Scrape price series and link with Selenium.
+    
+    - row: row from df_list.iterrows()
+    - add_row: if not None, the script will try to download again the information if status is not 'DOWNLOADED' or 'FOUND'
+    - skip_download: if True skips price series download
+    - check_cookies: if True, check for cookies tab and reject
+    '''
+    
+    url=row['url']
+    file_name=row['url2']
+    ticker=row['ticker']
+    
+    previous_time=0
+    status_download='SKIPPED'
+    error_download=''
+    website=''
+    page_type='ERROR'
+    error_website=''
+    skip_website=False
+    whitepaper=''
+    error_whitepaper=''
+    skip_whitepaper=False
+    if add_row is not None:
+        previous_time=add_row['TotTimeSec'][0]
+        if add_row['PriceSeriesStatus'][0] not in ['DOWNLOADED', 'UNTRACKED', 'PAGE_NOT_AVAILABLE']:
+            skip_download=False
+        else:
+            status_download='DOWNLOADED'
+        if add_row['WebsiteStatus'][0] == 'FOUND':
+            status_website='FOUND'
+            website=add_row['Website'][0]
+            page_type=add_row['PageType'][0]
+            skip_website=True
+        if add_row['WhitepaperStatus'][0] == 'FOUND':
+            status_whitepaper='FOUND'
+            whitepaper=add_row['Whitepaper'][0]
+            skip_whitepaper=True
+        
+
+    # create temp folder for csv download
+    temp_download_folder=os.path.join(os.getcwd(), 'temp_folder_' + file_name)
+    if os.path.exists(temp_download_folder):
+        shutil.rmtree(temp_download_folder)
+    os.makedirs(temp_download_folder)
+
+    expected_downloaded_file=os.path.join(temp_download_folder, ticker+'_ALL_graph_coinmarketcap.csv')
+    save_csv_path=os.path.join(price_folder, file_name + '.csv')
+
+    # open page
+    start=timer()
+    driver=get_chromedriver(chromedriver_path=chromedriver_path, download_folder=temp_download_folder)
+    driver.get(url)
+    wait=WebDriverWait(driver, 15)
+    if check_cookies:
+        try:              # close cookies
+            cookie=wait.until(
+                EC.presence_of_element_located((By.XPATH, '/html/body/div[3]/div[2]/div/div[1]/div/div[2]/div/button[2]')))
+            cookie.click()
+        except:
+            try:              # close cookies
+                cookie=wait.until(
+                    EC.presence_of_element_located((By.XPATH, '//*[@id="onetrust-reject-all-handler"]')))
+                cookie.click()
+            except:
+                pass
+    driver.maximize_window()
+    
+    # check if page not available
+    if any([x in driver.page_source for x in ['something went wrong', "Sorry, we couldn't find"]]):
+        status_download='PAGE_NOT_AVAILABLE'
+        skip_download=True
+        skip_website=True
+        status_website='ERROR'
+        skip_whitepaper=True
+        status_whitepaper='ERROR'
+    
+    # download price series
+    if not skip_download:
+        
+        # check if Market data is untracked
+        if any([x in driver.page_source for x in ['Market data is untracked', 'This project is an untracked listing']]):
+            status_download='UNTRACKED'
+            
+        else:
+            try:
+                # interact with chart and press download button
+                for scroll in [0, 300, 600, 900, 1200]:
+                    try:
+                        driver.execute_script(f"window.scrollTo(0, {scroll});")
+                        allButton=WebDriverWait(driver, 3).until(
+                            EC.presence_of_element_located((By.XPATH, '(//ul[@class="react-tabs__tab-list"])[1]//li[text()="ALL"]')))
+                        allButton.click()
+                        break
+                    except:
+                        pass
+                exportButton=allButton.find_element(By.XPATH, "(//li//div[contains(@class,'custom-button-inner')])[2]")
+                actions=ActionChains(driver)
+                actions.move_to_element(exportButton).pause(2).click().perform()
+                downloadAsCsvButton=wait.until(
+                    EC.visibility_of_element_located((By.XPATH, '//button[text()="Download price history (.csv)"]')))
+                downloadAsCsvButton.click()
+
+                # check download and move to folder
+                for time_left in Timeout(20):
+                    time.sleep(0.3)
+                    folder_content=os.listdir(temp_download_folder)
+                    if len(folder_content) > 0:
+                        status_download='FILE_DOWNLOADED_BUT_ERROR_IN_STORING'
+                    if os.path.exists(expected_downloaded_file):
+                        shutil.copy(expected_downloaded_file, save_csv_path)
+                        status_download='DOWNLOADED'
+                        break    
+            except Exception as e:
+                error_download=str(e)
+                status_download='ERROR'
+
+    if status_download != 'DOWNLOADED':
+        save_csv_path=None
+
+    # get website url
+    if not skip_website:
+        try:
+            websiteButton=driver.find_element(By.XPATH, '//div[text()="Website"]')
+            actions=ActionChains(driver)
+            actions.move_to_element(websiteButton).perform()
+            urlElement=wait.until(
+                EC.visibility_of_element_located((By.CSS_SELECTOR, 'div[class="tippy-content"] span')))
+            website=urlElement.text
+            status_website='FOUND'
+            page_type='NORMAL'
+        except Exception as e:
+            error_website=str(e)
+            status_website='ERROR'
+        # it seems there are two version of the same page, in the alternative one the Website button behaves differently,
+        # it shows the url as button text. Try to use xpath instead
+        if page_type == 'ERROR':
+            try:
+                websiteButton=driver.find_element(By.XPATH, '//*[@id="__next"]/div/div[1]/div[2]/div/div[1]/div[2]/div/div[1]/div[3]/div/div[1]/ul/li[1]/a')
+                website=websiteButton.get_attribute('href')
+                status_website='FOUND'
+                page_type='ALTERNATIVE'
+            except Exception as e:
+                error_website=str(e)
+                status_website='ERROR'
+
+    # get whitepaper url
+    if not skip_whitepaper:
+        try:
+            whitepaperButton = driver.find_element(By.XPATH, '//a[text()="Whitepaper"]')
+            whitepaper=whitepaperButton.get_attribute('href')
+            status_whitepaper='FOUND'
+        except Exception as e:
+            error_whitepaper=str(e)
+            status_whitepaper='ERROR'
+        
+    # take page screenshot for debug
+    screen_path=None
+#     if page_type == 'ALTERNATIVE' or status_website == 'ERROR':
+#         screen_path=os.path.join(screenshot_folder, file_name + '.png')
+#         driver.save_screenshot(screen_path)
+
+    # close page and remove temp folder
+    driver.close()
+    try:
+        shutil.rmtree(temp_download_folder)
+    except:
+        pass
+
+    add_row=pd.DataFrame({'url': url, 'PriceSeriesStatus': status_download, 'PriceSeriesPath': save_csv_path,
+                          'PriceSeriesError': error_download, 'PageType': page_type, 'WebsiteStatus': status_website,
+                          'Website': website, 'WebsiteError': error_website,  'WhitepaperStatus': status_whitepaper,
+                          'Whitepaper': whitepaper, 'WhitepaperError': error_whitepaper, 'ScreenPath': screen_path,
+                         'TotTimeSec': previous_time + datetime.timedelta(seconds=round(timer()-start)).total_seconds()}, index=[0])
+    
+    return add_row
+
+
+def navigate_html(nested: dict, key='', value=''):
+    for k, v in nested.items():
+#         if k == key and v == value:
+        if key in v:
+            yield {k: v}
+        elif isinstance(v, list):
+            for d in v:
+                if isinstance(d, dict):
+                    yield from navigate_html(d, key, value)
+                    
+                    
+def scrape_icomarketcap_link_only(row):
+    
+    '''
+    Scrape only links, with request instead of Selenium.
+    
+    - row: row from df_list.iterrows()
+    '''
+    
+    url=row['url']
+    file_name=row['url2']
+    warnings=''
+    error=''
+    error_dict=''
+    
+    start=timer()
+    try:
+        webpage = requests.get(url)
+        soup = BeautifulSoup(webpage.content, "html.parser")
+        d=convert(soup)
+        if any([x in soup.prettify() for x in ['something went wrong', "Sorry, we couldn't find"]]):
+            error='PAGE_NOT_AVAILABLE'
+        else:            
+            # find string with "urls"
+            s=list(navigate_html(d, 'urls'))
+            if len(s) > 1:
+                warnings='len(s) > 1'
+                for sub_s in s:
+                    if '"urls"' in str(sub_s):
+                        s=[sub_s]
+            s=str(s[0])
+            # extract string and convert to dictionary
+            start_ind=s.find('"urls":')+7
+            end_ind=s.find('}', start_ind)+1
+            error_dict=s[start_ind:end_ind]
+            d=json.loads(error_dict)
+    except Exception as e:
+        error=str(e)
+    
+    add_row=pd.DataFrame({'url': url, 'file_name': file_name, 'data': [d], 'warnings': warnings, 'error': error,
+                          'error_dict': error_dict,
+                          'TotTimeSec': datetime.timedelta(seconds=round(timer()-start)).total_seconds()})
+    
+    return add_row
